@@ -1,5 +1,11 @@
 package com.lalit.chitrakosha.ui.screens.gallery
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.MediaStore
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.IntentSenderRequest
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.lalit.chitrakosha.data.Album
@@ -21,13 +27,17 @@ class GalleryViewModel(
 ) : ViewModel() {
 
     private val _mediaItems = MutableStateFlow<List<MediaItem>>(emptyList())
-    
+    private val _hasLoaded = MutableStateFlow(false)
+
     val uiState: StateFlow<GalleryUiState> = combine(
         _mediaItems,
+        _hasLoaded,
         favoriteDao.getAllFavoriteIds()
-    ) { items, favoriteIds ->
-        if (items.isEmpty()) {
+    ) { items, hasLoaded, favoriteIds ->
+        if (!hasLoaded) {
             GalleryUiState.Loading
+        } else if (items.isEmpty()) {
+            GalleryUiState.Empty
         } else {
             val favoriteIdSet = favoriteIds.toSet()
             val itemsWithFavorites = items.map { it.copy(isFavorite = favoriteIdSet.contains(it.id)) }
@@ -41,9 +51,36 @@ class GalleryViewModel(
     private val _selectedAlbumId = MutableStateFlow<Long?>(null)
     val selectedAlbumId = _selectedAlbumId.asStateFlow()
 
+    // --- Selection State ---
+    private val _selectedIds = MutableStateFlow<Set<Long>>(emptySet())
+    val selectedIds: StateFlow<Set<Long>> = _selectedIds.asStateFlow()
+
+    val isSelectionMode: StateFlow<Boolean> = combine(_selectedIds) { ids ->
+        ids.first().isNotEmpty()
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
+
+    fun toggleSelection(id: Long) {
+        _selectedIds.value = _selectedIds.value.toMutableSet().apply {
+            if (contains(id)) remove(id) else add(id)
+        }
+    }
+
+    fun selectAll() {
+        val currentState = uiState.value
+        if (currentState is GalleryUiState.Success) {
+            _selectedIds.value = currentState.images.map { it.id }.toSet()
+        }
+    }
+
+    fun clearSelection() {
+        _selectedIds.value = emptySet()
+    }
+
+    // --- Filtered Gallery State ---
     val filteredGalleryState: StateFlow<GalleryUiState> = combine(uiState, _selectedAlbumId) { state, albumId ->
         if (state is GalleryUiState.Success && albumId != null) {
-            GalleryUiState.Success(state.images.filter { it.bucketId == albumId })
+            val filtered = state.images.filter { it.bucketId == albumId }
+            if (filtered.isEmpty()) GalleryUiState.Empty else GalleryUiState.Success(filtered)
         } else {
             state
         }
@@ -77,8 +114,10 @@ class GalleryViewModel(
             try {
                 val images = repository.fetchImages()
                 _mediaItems.value = images
+                _hasLoaded.value = true
             } catch (e: Exception) {
-                // In a real app, handle error state via another flow
+                _hasLoaded.value = true
+                _mediaItems.value = emptyList()
             }
         }
     }
@@ -113,16 +152,58 @@ class GalleryViewModel(
     fun selectAlbum(albumId: Long?) {
         _selectedAlbumId.value = albumId
     }
+
+    // --- Share ---
+    fun sharePhotos(context: Context, uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val intent = if (uris.size == 1) {
+            Intent(Intent.ACTION_SEND).apply {
+                type = "image/*"
+                putExtra(Intent.EXTRA_STREAM, uris.first())
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        } else {
+            Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+                type = "image/*"
+                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        }
+        context.startActivity(Intent.createChooser(intent, "Share via").apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        })
+    }
+
+    // --- Delete ---
+    fun deletePhotos(
+        context: Context,
+        uris: List<Uri>,
+        launcher: ActivityResultLauncher<IntentSenderRequest>
+    ) {
+        if (uris.isEmpty()) return
+        val pendingIntent = MediaStore.createDeleteRequest(
+            context.contentResolver,
+            uris
+        )
+        val intentSenderRequest = IntentSenderRequest.Builder(pendingIntent.intentSender).build()
+        launcher.launch(intentSenderRequest)
+    }
+
+    fun onDeleteCompleted() {
+        clearSelection()
+        loadImages()
+    }
 }
 
 sealed interface GalleryUiState {
-    object Loading : GalleryUiState
+    data object Loading : GalleryUiState
+    data object Empty : GalleryUiState
     data class Success(val images: List<MediaItem>) : GalleryUiState
     data class Error(val message: String) : GalleryUiState
 }
 
 sealed interface AlbumsUiState {
-    object Loading : AlbumsUiState
+    data object Loading : AlbumsUiState
     data class Success(val albums: List<Album>) : AlbumsUiState
     data class Error(val message: String) : AlbumsUiState
 }
